@@ -10,3 +10,4 @@ sentencepiece
 langchain==0.3.27
 langchain-community==0.3.16
 langchain-huggingface==0.1.2
+langchain-core==1.2.12
