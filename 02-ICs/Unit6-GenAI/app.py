@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 import os
 from pathlib import Path
+from collections import OrderedDict
 
 app = Flask(__name__)
 
@@ -19,53 +20,93 @@ Return only these sections exactly once, in order, no extra text:\n
 """
 
 MODELS_LIST = [
-    "EleutherAI/gpt-j-6B",
+    # Replaced the very large gpt-j-6B with smaller, easier-to-run alternatives for local testing
+    "EleutherAI/gpt-neo-125M",    # small causal LM, low resource
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "google/flan-t5-base",
     "google/flan-t5-large",
-    "facebook/opt-1.3B",
+    "facebook/opt-125m",
     "tiiuae/falcon-rw-1b",
     "microsoft/phi-2"
 ]
 
 # Cache for loaded models to avoid reloading every time if the user picks the same one
-# However, for a simple app, we might just load each time as requested by the prompt "model loads"
-model_cache = {}
+# Use an OrderedDict to implement a simple LRU eviction policy and per-model locks
+CACHE_MAX = 4
+model_cache = OrderedDict()  # model_name -> {'model': ..., 'tok': ..., 'lock': threading.Lock()}
+cache_lock = threading.Lock()
 
 REPORT_DIR = Path(__file__).parent / 'reports'
 REPORT_PATH = REPORT_DIR / 'last_report.json'
 
-def get_model(model_name):
-    if model_name in model_cache:
-        return model_cache[model_name]
-    
-    # load the model/tokenizer
-    tok = AutoTokenizer.from_pretrained(model_name)
-    if tok is None:
-        # Defensive: if tokenizer failed to load, surface an explicit error
-        raise RuntimeError(f"Tokenizer failed to load for model: {model_name}")
+def get_model(model_name, force_reload: bool = False):
+    """Load and cache models in a thread-safe way.
 
-    # Choose the correct model class based on the model name
-    if "t5" in model_name.lower():
-        model_class = AutoModelForSeq2SeqLM
-        # For T5, we might need to load in float32 for stability on CPU
-        model = model_class.from_pretrained(model_name).to(device).eval()
-    elif "gpt-j" in model_name.lower():
-        model_class = AutoModelForCausalLM
-        # GPT-J-6B is huge, use 8-bit or half precision if possible, but on CPU we are limited.
-        # Let's try to at least use low_cpu_mem_usage.
-        model = model_class.from_pretrained(model_name,
-                                            dtype=torch.float32 if device.type == "cpu" else torch.float16,
-                                            low_cpu_mem_usage=True
-                                            ).to(device).eval()
-    else:
-        model_class = AutoModelForCausalLM
-        model = model_class.from_pretrained(model_name,
-                                            dtype=torch.float16 if device.type == "cuda" else torch.float32,
-                                            low_cpu_mem_usage=True
-                                            ).to(device).eval()
-    
-    model_cache[model_name] = (model, tok)
+    Returns (model, tokenizer).
+    If `force_reload` is True the model will be reloaded.
+    """
+    if not model_name:
+        raise ValueError("model_name is required")
+
+    # Quick path: return cached model if present (and not force_reload)
+    with cache_lock:
+        if not force_reload and model_name in model_cache:
+            entry = model_cache.pop(model_name)
+            # move to the end to mark as recently used
+            model_cache[model_name] = entry
+            if entry.get('model') is not None and entry.get('tok') is not None:
+                return entry['model'], entry['tok']
+            # If model/tokenizer not yet populated, we'll wait on per-model lock below
+        else:
+            # create a placeholder entry with a per-model lock so concurrent loads coordinate
+            entry = {'model': None, 'tok': None, 'lock': threading.Lock()}
+            model_cache[model_name] = entry
+            # enforce cache size
+            if len(model_cache) > CACHE_MAX:
+                # pop the least recently used item
+                try:
+                    model_cache.popitem(last=False)
+                except Exception:
+                    pass
+
+    # Acquire the per-model lock while we perform the potentially expensive load
+    with entry['lock']:
+        # Another thread may have finished loading while we waited for the lock
+        if entry.get('model') is not None and entry.get('tok') is not None and not force_reload:
+            return entry['model'], entry['tok']
+
+        # load the tokenizer
+        tok = AutoTokenizer.from_pretrained(model_name)
+        if tok is None:
+            raise RuntimeError(f"Tokenizer failed to load for model: {model_name}")
+
+        # Choose the correct model class based on the model name
+        if "t5" in model_name.lower():
+            model_class = AutoModelForSeq2SeqLM
+            model = model_class.from_pretrained(model_name).to(device).eval()
+        elif "gpt-j" in model_name.lower():
+            model_class = AutoModelForCausalLM
+            model = model_class.from_pretrained(model_name,
+                                                dtype=torch.float32 if device.type == "cpu" else torch.float16,
+                                                low_cpu_mem_usage=True
+                                                ).to(device).eval()
+        else:
+            model_class = AutoModelForCausalLM
+            model = model_class.from_pretrained(model_name,
+                                                dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                                                low_cpu_mem_usage=True
+                                                ).to(device).eval()
+
+        # store into the cache entry
+        entry['model'] = model
+        entry['tok'] = tok
+
+    # Ensure the entry is marked as recently used (move to end)
+    with cache_lock:
+        if model_name in model_cache:
+            model_cache.pop(model_name)
+        model_cache[model_name] = entry
+
     return model, tok
 
 
@@ -308,6 +349,18 @@ def report_demo():
 @app.route("/summary")
 def summary():
     return render_template("summary.html")
+
+@app.route('/_cache')
+def cache_status():
+    # Debug-only endpoint to view cache contents
+    if not app.debug:
+        return Response(json.dumps({'error': 'cache inspection disabled'}), status=403, mimetype='application/json')
+    with cache_lock:
+        entries = []
+        for k, v in model_cache.items():
+            entries.append({'model_name': k, 'loaded': bool(v.get('model') is not None and v.get('tok') is not None)})
+    return Response(json.dumps({'cache_max': CACHE_MAX, 'size': len(entries), 'entries': entries}, indent=2), mimetype='application/json')
+
 
 if __name__ == "__main__":
     app.run(debug=True)
