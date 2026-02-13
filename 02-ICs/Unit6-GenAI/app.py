@@ -3,12 +3,17 @@ import torch
 from flask import Flask, render_template, request, Response, stream_with_context
 import json
 import threading
+from datetime import datetime
 
 app = Flask(__name__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-PROMPT_SYSTEM = """You are an advertising specialist for BikeEase, a company that sells and rents bikes. Given the bike specifications, discount information, and marketing theme, generate a compelling and intuitive advertisement text. Highlight the key features and benefits effectively.
+PROMPT_SYSTEM = """
+You are an advertising specialist for BikeEase, a company that sells and rents bikes. 
+Given the bike specifications, discount information, and marketing theme, 
+generate a compelling and intuitive advertisement text. Highlight the key features and benefits effectively.
+Return only these sections exactly once, in order, no extra text:\n
 """
 
 MODELS_LIST = [
@@ -31,16 +36,30 @@ def get_model(model_name):
     
     # load the model/tokenizer
     tok = AutoTokenizer.from_pretrained(model_name)
-    
+    if tok is None:
+        # Defensive: if tokenizer failed to load, surface an explicit error
+        raise RuntimeError(f"Tokenizer failed to load for model: {model_name}")
+
     # Choose the correct model class based on the model name
     if "t5" in model_name.lower():
         model_class = AutoModelForSeq2SeqLM
+        # For T5, we might need to load in float32 for stability on CPU
+        model = model_class.from_pretrained(model_name).to(device).eval()
+    elif "gpt-j" in model_name.lower():
+        model_class = AutoModelForCausalLM
+        # GPT-J-6B is huge, use 8-bit or half precision if possible, but on CPU we are limited.
+        # Let's try to at least use low_cpu_mem_usage.
+        model = model_class.from_pretrained(model_name,
+                                            dtype=torch.float32 if device.type == "cpu" else torch.float16,
+                                            low_cpu_mem_usage=True
+                                            ).to(device).eval()
     else:
         model_class = AutoModelForCausalLM
-        
-    model = model_class.from_pretrained(model_name,
-                                        dtype=torch.float16 if device.type == "cuda" else torch.float32
-                                        ).to(device).eval()
+        model = model_class.from_pretrained(model_name,
+                                            dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                                            low_cpu_mem_usage=True
+                                            ).to(device).eval()
+    
     model_cache[model_name] = (model, tok)
     return model, tok
 
@@ -76,16 +95,36 @@ def generate():
     Specs: {specs} 
     Discount: {discount} 
     Theme: {theme}
+    Website url  
     
     Write the advertisement text now.
     """
-            inputs = tok(prompt, return_tensors="pt").to(device)
+            # Use Chat template for TinyLlama
+            if "tinyllama" in model_name.lower():
+                prompt = f"<|system|>\n{PROMPT_SYSTEM}</s>\n<|user|>\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}</s>\n<|assistant|>\n"
+            elif "phi-2" in model_name.lower():
+                prompt = f"Instruct: {PROMPT_SYSTEM}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}\nOutput:"
+            elif "flan-t5" in model_name.lower():
+                prompt = f"{PROMPT_SYSTEM}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}"
+            
+            inputs = tok(prompt, return_tensors="pt")
+            if inputs is None:
+                raise RuntimeError("Tokenizer returned no inputs for the prompt")
+            inputs = inputs.to(device)
             input_ids = inputs["input_ids"]
             
+            # Use local pad/eos ids (defensive) to avoid modifying tokenizer object and silence static checks
+            pad_token_id = getattr(tok, 'pad_token_id', None)
+            eos_token_id = getattr(tok, 'eos_token_id', None)
+            if pad_token_id is None:
+                pad_token_id = eos_token_id if eos_token_id is not None else 0
+            if eos_token_id is None:
+                eos_token_id = pad_token_id
+
             streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
             
-            # For progress percentage, we can estimate based on max_new_tokens
-            max_new_tokens = 150
+            # Increased max_new_tokens to prevent early cutoff
+            max_new_tokens = 512
             
             generation_kwargs = dict(
                 input_ids=input_ids,
@@ -96,8 +135,8 @@ def generate():
                 top_p=0.9,
                 repetition_penalty=1.15,
                 no_repeat_ngram_size=4,
-                eos_token_id=tok.eos_token_id,
-                pad_token_id=tok.eos_token_id
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id
             )
 
             # Run generation in a separate thread
@@ -113,15 +152,67 @@ def generate():
                 tokens_generated += 1
                 # Progress from 50% to 100%
                 progress = min(50 + int((tokens_generated / max_new_tokens) * 50), 99)
-                yield f"data: {json.dumps({'status': 'Generating...', 'progress': progress, 'text': generated_text})}\n\n"
+                if new_text.strip() or tokens_generated % 5 == 0:
+                    yield f"data: {json.dumps({'status': 'Generating...', 'progress': progress, 'text': generated_text})}\n\n"
 
-            yield f"data: {json.dumps({'status': 'Done!', 'progress': 100, 'text': generated_text})}\n\n"
+            if not generated_text:
+                yield f"data: {json.dumps({'error': 'Model returned empty output. Try a different model or prompt.'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'status': 'Done!', 'progress': 100, 'text': generated_text})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return Response(stream_with_context(stream()), mimetype="text/event-stream")
 
 
+# New demo route: render the polished summary report template with sample data
+@app.route('/report')
+def report_demo():
+    # Sample data to demonstrate the summary template
+    sample_data = {
+        'report_title': 'Wonderful Report Summary',
+        'report_subtitle': 'Model run summary and high-level recommendations',
+        'report_date': datetime.now().strftime('%B %d, %Y'),
+        'author': 'Automated Report System',
+        'executive_summary': 'This report summarizes the recent model run and highlights the primary findings, key metrics, and recommended next steps for stakeholders.',
+        'findings': [
+            {'title': 'Improved Accuracy', 'detail': 'Validation accuracy increased by 4.3% compared to previous run.'},
+            {'title': 'Lower Latency', 'detail': 'Average inference latency reduced by 18%.'}
+        ],
+        'recommendations': [
+            'Deploy new model to staging and monitor memory usage.',
+            'Increase batch size for throughput improvements where latency budget allows.',
+            'Collect more labeled samples for edge cases to improve robustness.'
+        ],
+        'notes': 'All experiments were run on a mixed GPU/CPU environment. See logs for per-run details.',
+        'metrics': {'Accuracy': '92.3%', 'Throughput': '480 req/s', 'Latency (p95)': '135 ms'},
+        'summary_table': [
+            {'label': 'Total Runs', 'value': '42'},
+            {'label': 'Successful', 'value': '40'},
+            {'label': 'Failed', 'value': '2'}
+        ],
+        'version': '1.0'
+    }
+
+    # Example Chart.js configuration passed as JSON
+    chart_config = {
+        'type': 'bar',
+        'data': {
+            'labels': ['Accuracy', 'Throughput', 'Latency (p95)'],
+            'datasets': [{
+                'label': 'Metric Values',
+                'data': [92.3, 480, 135],
+                'backgroundColor': ['#4e79a7', '#f28e2b', '#e15759']
+            }]
+        },
+        'options': {
+            'responsive': True,
+            'plugins': {'legend': {'display': False}}
+        }
+    }
+
+    return render_template('summary.html', **sample_data, metrics_chart_json=json.dumps(chart_config))
+
+
 if __name__ == "__main__":
     app.run(debug=True)
-

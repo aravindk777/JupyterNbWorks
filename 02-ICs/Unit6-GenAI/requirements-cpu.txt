@@ -1,0 +1,14 @@
+# CPU-friendly dependency helper
+# This file lists the Python packages used by the project without CUDA-specific wheels.
+# Install PyTorch CPU packages with the official CPU index, for example:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+transformers
+accelerate
+flask
+sentencepiece
+# PyTorch packages: install with the CPU index (see the comment above)
+# torch
+# torchvision
+# torchaudio
+
