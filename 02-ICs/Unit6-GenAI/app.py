@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, TextIteratorStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, TextIteratorStreamer, pipeline
 import torch
 from flask import Flask, render_template, request, Response, stream_with_context
 import json
@@ -7,6 +7,10 @@ from datetime import datetime
 import os
 from pathlib import Path
 from collections import OrderedDict
+
+from langchain_huggingface import HuggingFacePipeline
+from langchain_core.prompts import PromptTemplate
+from langchain_core.callbacks import BaseCallbackHandler
 
 app = Flask(__name__)
 
@@ -33,33 +37,33 @@ MODELS_LIST = [
 # Cache for loaded models to avoid reloading every time if the user picks the same one
 # Use an OrderedDict to implement a simple LRU eviction policy and per-model locks
 CACHE_MAX = 4
-model_cache = OrderedDict()  # model_name -> {'model': ..., 'tok': ..., 'lock': threading.Lock()}
+model_cache = OrderedDict()  # model_name -> {'llm': ..., 'lock': threading.Lock()}
 cache_lock = threading.Lock()
 
 REPORT_DIR = Path(__file__).parent / 'reports'
 REPORT_PATH = REPORT_DIR / 'last_report.json'
 
-def get_model(model_name, force_reload: bool = False):
-    """Load and cache models in a thread-safe way.
+def get_llm(model_name, force_reload: bool = False):
+    """Load and cache LangChain LLM in a thread-safe way.
 
-    Returns (model, tokenizer).
+    Returns HuggingFacePipeline instance.
     If `force_reload` is True the model will be reloaded.
     """
     if not model_name:
         raise ValueError("model_name is required")
 
-    # Quick path: return cached model if present (and not force_reload)
+    # Quick path: return cached LLM if present (and not force_reload)
     with cache_lock:
         if not force_reload and model_name in model_cache:
             entry = model_cache.pop(model_name)
             # move to the end to mark as recently used
             model_cache[model_name] = entry
-            if entry.get('model') is not None and entry.get('tok') is not None:
-                return entry['model'], entry['tok']
-            # If model/tokenizer not yet populated, we'll wait on per-model lock below
+            if entry.get('llm') is not None:
+                return entry['llm']
+            # If LLM not yet populated, we'll wait on per-model lock below
         else:
             # create a placeholder entry with a per-model lock so concurrent loads coordinate
-            entry = {'model': None, 'tok': None, 'lock': threading.Lock()}
+            entry = {'llm': None, 'lock': threading.Lock()}
             model_cache[model_name] = entry
             # enforce cache size
             if len(model_cache) > CACHE_MAX:
@@ -72,8 +76,8 @@ def get_model(model_name, force_reload: bool = False):
     # Acquire the per-model lock while we perform the potentially expensive load
     with entry['lock']:
         # Another thread may have finished loading while we waited for the lock
-        if entry.get('model') is not None and entry.get('tok') is not None and not force_reload:
-            return entry['model'], entry['tok']
+        if entry.get('llm') is not None and not force_reload:
+            return entry['llm']
 
         # load the tokenizer
         tok = AutoTokenizer.from_pretrained(model_name)
@@ -82,24 +86,37 @@ def get_model(model_name, force_reload: bool = False):
 
         # Choose the correct model class based on the model name
         if "t5" in model_name.lower():
+            task = "text2text-generation"
             model_class = AutoModelForSeq2SeqLM
             model = model_class.from_pretrained(model_name).to(device).eval()
-        elif "gpt-j" in model_name.lower():
-            model_class = AutoModelForCausalLM
-            model = model_class.from_pretrained(model_name,
-                                                dtype=torch.float32 if device.type == "cpu" else torch.float16,
-                                                low_cpu_mem_usage=True
-                                                ).to(device).eval()
         else:
+            task = "text-generation"
             model_class = AutoModelForCausalLM
+            if "gpt-j" in model_name.lower():
+                dtype = torch.float32 if device.type == "cpu" else torch.float16
+            else:
+                dtype = torch.float16 if device.type == "cuda" else torch.float32
+            
             model = model_class.from_pretrained(model_name,
-                                                dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                                                torch_dtype=dtype,
                                                 low_cpu_mem_usage=True
                                                 ).to(device).eval()
 
+        pipe = pipeline(
+            task,
+            model=model,
+            tokenizer=tok,
+            device=device if device.type == "cuda" else -1,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.95,
+        )
+        
+        llm = HuggingFacePipeline(pipeline=pipe)
+
         # store into the cache entry
-        entry['model'] = model
-        entry['tok'] = tok
+        entry['llm'] = llm
 
     # Ensure the entry is marked as recently used (move to end)
     with cache_lock:
@@ -107,7 +124,7 @@ def get_model(model_name, force_reload: bool = False):
             model_cache.pop(model_name)
         model_cache[model_name] = entry
 
-    return model, tok
+    return llm
 
 
 @app.route("/", methods=["GET"])
@@ -132,73 +149,90 @@ def generate():
     theme = request.args.get("theme")
 
     def stream():
+        class StreamHandler(BaseCallbackHandler):
+            def __init__(self):
+                self.generated_text = ""
+                self.tokens_generated = 0
+
+            def on_llm_new_token(self, token: str, **kwargs) -> None:
+                self.generated_text += token
+                self.tokens_generated += 1
+                progress = min(50 + int((self.tokens_generated / 512) * 50), 99)
+                # Note: We can't yield from here as it's a callback, but we can update a shared state
+                # However, for Flask streaming we need a different approach if we want real-time.
+                # HuggingFacePipeline with stream() is better.
+
         try:
             yield f"data: {json.dumps({'status': 'Loading model...', 'progress': 10})}\n\n"
-            model, tok = get_model(model_name)
+            llm = get_llm(model_name)
             yield f"data: {json.dumps({'status': 'Model loaded. Preparing prompt...', 'progress': 40})}\n\n"
 
-            prompt = f"""{PROMPT_SYSTEM}
-    Specs: {specs} 
-    Discount: {discount} 
-    Theme: {theme}
-    Website url  
-    
-    Write the advertisement text now.
-    """
-            # Use Chat template for TinyLlama
+            # Use PromptTemplate for cleaner interface
             if "tinyllama" in model_name.lower():
-                prompt = f"<|system|>\n{PROMPT_SYSTEM}</s>\n<|user|>\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}</s>\n<|assistant|>\n"
+                template = "<|system|>\n{system_prompt}</s>\n<|user|>\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}</s>\n<|assistant|>\n"
             elif "phi-2" in model_name.lower():
-                prompt = f"Instruct: {PROMPT_SYSTEM}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}\nOutput:"
+                template = "Instruct: {system_prompt}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}\nOutput:"
             elif "flan-t5" in model_name.lower():
-                prompt = f"{PROMPT_SYSTEM}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}"
-            
-            inputs = tok(prompt, return_tensors="pt")
-            if inputs is None:
-                raise RuntimeError("Tokenizer returned no inputs for the prompt")
-            inputs = inputs.to(device)
-            input_ids = inputs["input_ids"]
-            
-            # Use local pad/eos ids (defensive) to avoid modifying tokenizer object and silence static checks
-            pad_token_id = getattr(tok, 'pad_token_id', None)
-            eos_token_id = getattr(tok, 'eos_token_id', None)
-            if pad_token_id is None:
-                pad_token_id = eos_token_id if eos_token_id is not None else 0
-            if eos_token_id is None:
-                eos_token_id = pad_token_id
+                template = "{system_prompt}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}"
+            else:
+                template = "{system_prompt}\nSpecs: {specs}\nDiscount: {discount}\nTheme: {theme}\nWebsite url\nWrite the advertisement text now.\n"
 
-            streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
-            
-            # Increased max_new_tokens to prevent early cutoff
-            max_new_tokens = 512
-            
-            generation_kwargs = dict(
-                input_ids=input_ids,
-                streamer=streamer,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                repetition_penalty=1.15,
-                no_repeat_ngram_size=4,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id
+            prompt_template = PromptTemplate.from_template(template)
+            prompt = prompt_template.format(
+                system_prompt=PROMPT_SYSTEM,
+                specs=specs,
+                discount=discount,
+                theme=theme
             )
-
-            # Run generation in a separate thread
-            thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
-            thread.start()
 
             yield f"data: {json.dumps({'status': 'Generating text...', 'progress': 50})}\n\n"
 
             generated_text = ""
             tokens_generated = 0
-            for new_text in streamer:
-                generated_text += new_text
-                tokens_generated += 1
-                # Progress from 50% to 100%
-                progress = min(50 + int((tokens_generated / max_new_tokens) * 50), 99)
-                if new_text.strip() or tokens_generated % 5 == 0:
+            
+            # Use llm.stream() for real LangChain streaming
+            # Workaround for Seq2Seq models which have a bug in langchain-huggingface stream()
+            if "t5" in model_name.lower():
+                # For Seq2Seq models, we use a manual streaming approach to avoid the 'inputs' TypeError
+                # which occurs in langchain-huggingface's internal threading logic.
+                from threading import Thread
+                
+                pipe = llm.pipeline
+                tokenizer = pipe.tokenizer
+                model = pipe.model
+                
+                # Use pipeline's config to stay consistent with original setup
+                gen_config = pipe.model.generation_config
+                
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                # For Seq2Seq models, skip_prompt=True can sometimes cause issues or be unnecessary
+                # as the prompt is not in the decoder output.
+                streamer = TextIteratorStreamer(tokenizer, skip_prompt=False, skip_special_tokens=True)
+                
+                generation_kwargs = dict(
+                    **inputs,
+                    streamer=streamer,
+                    max_new_tokens=pipe.kwargs.get("max_new_tokens", 512),
+                    do_sample=pipe.kwargs.get("do_sample", True),
+                    temperature=pipe.kwargs.get("temperature", 0.7),
+                    top_p=pipe.kwargs.get("top_p", 0.95),
+                )
+                
+                thread = Thread(target=model.generate, kwargs=generation_kwargs)
+                thread.start()
+                
+                for chunk in streamer:
+                    if not chunk:
+                        continue
+                    generated_text += chunk
+                    tokens_generated += 1
+                    progress = min(50 + int((tokens_generated / 512) * 50), 99)
+                    yield f"data: {json.dumps({'status': 'Generating...', 'progress': progress, 'text': generated_text})}\n\n"
+            else:
+                for chunk in llm.stream(prompt):
+                    generated_text += chunk
+                    tokens_generated += 1
+                    progress = min(50 + int((tokens_generated / 512) * 50), 99)
                     yield f"data: {json.dumps({'status': 'Generating...', 'progress': progress, 'text': generated_text})}\n\n"
 
             if not generated_text:
@@ -230,7 +264,7 @@ def generate():
 
                     # Add recommendations based on the ratio of chars to tokens
                     try:
-                        tokens_val = float(max_new_tokens)/float(tokens_generated) if tokens_generated else 0.0
+                        tokens_val = float(512)/float(tokens_generated) if tokens_generated else 0.0
                         ratio = (len(generated_text) / tokens_val) if tokens_val > 0 else 0.0
                     except Exception:
                         ratio = 0.0
@@ -358,7 +392,7 @@ def cache_status():
     with cache_lock:
         entries = []
         for k, v in model_cache.items():
-            entries.append({'model_name': k, 'loaded': bool(v.get('model') is not None and v.get('tok') is not None)})
+            entries.append({'model_name': k, 'loaded': bool(v.get('llm') is not None)})
     return Response(json.dumps({'cache_max': CACHE_MAX, 'size': len(entries), 'entries': entries}, indent=2), mimetype='application/json')
 
 

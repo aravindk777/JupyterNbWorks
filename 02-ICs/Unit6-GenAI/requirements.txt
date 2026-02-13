@@ -1,8 +1,12 @@
 --extra-index-url https://download.pytorch.org/whl/cu130
-transformers
+transformers==4.46.3
+huggingface-hub==0.26.2
 accelerate
 torch==2.10.0+cu130
 torchvision==0.25.0+cu130
 torchaudio==2.10.0+cu130
 flask
 sentencepiece
+langchain==0.3.27
+langchain-community==0.3.16
+langchain-huggingface==0.1.2
