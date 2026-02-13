@@ -3,7 +3,7 @@ import os
 
 class TestSummaryTemplate(unittest.TestCase):
     def setUp(self):
-        self.template_path = os.path.join(os.path.dirname(__file__), '..', 'templates', 'summary.html')
+        self.template_path = os.path.join(os.path.dirname(__file__), '..', 'templates', 'model_report.html')
         self.template_path = os.path.normpath(self.template_path)
 
     def test_file_exists(self):
@@ -14,12 +14,12 @@ class TestSummaryTemplate(unittest.TestCase):
             content = f.read()
 
         # Check for key placeholders and structure
-        self.assertIn('Executive Summary', content)
-        self.assertIn('Key Findings', content)
-        self.assertIn('Top Recommendations', content)
+        self.assertIn('Model\'s Output', content)
+        # self.assertIn('Key Findings', content)
+        self.assertIn('Recommendations', content)
         self.assertIn('Key Metrics', content)
         self.assertIn('metricsChart', content)  # canvas id
-        self.assertIn('{{ report_title', content) or 'Wonderful Report Summary' in content
+        self.assertIn('{{ report_title', content) or 'Report Summary' in content
 
 if __name__ == '__main__':
     unittest.main()

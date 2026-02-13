@@ -4,6 +4,8 @@ from flask import Flask, render_template, request, Response, stream_with_context
 import json
 import threading
 from datetime import datetime
+import os
+from pathlib import Path
 
 app = Flask(__name__)
 
@@ -29,6 +31,9 @@ MODELS_LIST = [
 # Cache for loaded models to avoid reloading every time if the user picks the same one
 # However, for a simple app, we might just load each time as requested by the prompt "model loads"
 model_cache = {}
+
+REPORT_DIR = Path(__file__).parent / 'reports'
+REPORT_PATH = REPORT_DIR / 'last_report.json'
 
 def get_model(model_name):
     if model_name in model_cache:
@@ -158,6 +163,86 @@ def generate():
             if not generated_text:
                 yield f"data: {json.dumps({'error': 'Model returned empty output. Try a different model or prompt.'})}\n\n"
             else:
+                # Build a simple summary JSON that other parts of the app can read
+                try:
+                    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+                    summary = {
+                        'report_title': f'Run Summary - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+                        'report_subtitle': 'Automatically generated after model run',
+                        'report_date': datetime.now().strftime('%B %d, %Y'),
+                        'author': 'AutoGenerator',
+                        'executive_summary': (generated_text[:1000] + '...') if len(generated_text) > 1000 else generated_text,
+                        'findings': [],
+                        'recommendations': [],
+                        'notes': f'Generated {len(generated_text)} characters; tokens_estimate={tokens_generated}',
+                        'metrics': {
+                            'Chars': str(len(generated_text)),
+                            'Tokens_Est': str(tokens_generated)
+                        },
+                        'summary_table': [
+                            {'label': 'Generated Chars', 'value': str(len(generated_text))},
+                            {'label': 'Token Estimate', 'value': str(tokens_generated)}
+                        ],
+                        'version': '1.0',
+                        'generated_text': generated_text
+                    }
+
+                    # Add recommendations based on the ratio of chars to tokens
+                    try:
+                        tokens_val = float(max_new_tokens)/float(tokens_generated) if tokens_generated else 0.0
+                        ratio = (len(generated_text) / tokens_val) if tokens_val > 0 else 0.0
+                    except Exception:
+                        ratio = 0.0
+
+                    # Assumption: interpret thresholds as follows:
+                    # - ratio >= 3 => very good model
+                    # - 2 <= ratio < 3 => moderate model
+                    # - ratio < 2 => not recommended
+                    if ratio >= 3.0:
+                        rec = (
+                            "Model quality appears very good (chars/tokens ratio >= 3). "
+                            "Consider this model for running extended text generations and more derivations."
+                        )
+                    elif ratio >= 2.0:
+                        rec = (
+                            "Model quality appears moderate (chars/tokens ratio between 2 and 3). "
+                            "Consider additional tuning (e.g., more data, hyperparameter tweaks) before production use."
+                        )
+                    else:
+                        rec = (
+                            "Model is not recommended (chars/tokens ratio < 2). "
+                            "Do not use for real world production use-case; review model configuration, prompt, or Tokenizer settings."
+                        )
+
+                    # Insert the recommendation and a short quality note into the summary
+                    summary['recommendations'] = [rec]
+                    summary['metrics']['Chars_per_Token'] = f"{ratio:.2f}"
+
+                    # Simple chart config: show token/char measures
+                    chart_config = {
+                        'type': 'bar',
+                        'data': {
+                            'labels': ['Chars', 'Tokens_Est'],
+                            'datasets': [{
+                                'label': 'Run metrics',
+                                'data': [len(generated_text), tokens_generated],
+                                'backgroundColor': ['#4e79a7', '#f28e2b']
+                            }]
+                        },
+                        'options': {'responsive': True}
+                    }
+
+                    # Save JSON including chart config (atomic write)
+                    out = dict(summary=summary, chart_config=chart_config)
+                    temp_path = REPORT_PATH.with_suffix('.tmp')
+                    with open(temp_path, 'w', encoding='utf-8') as fh:
+                        json.dump(out, fh, ensure_ascii=False, indent=2)
+                    # Atomic replace
+                    os.replace(str(temp_path), str(REPORT_PATH))
+                except Exception as e:
+                    # If writing the report fails, continue but include an error in the stream
+                    yield f"data: {json.dumps({'status': 'Warning: failed to write report', 'error': str(e)})}\n\n"
+
                 yield f"data: {json.dumps({'status': 'Done!', 'progress': 100, 'text': generated_text})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -165,54 +250,64 @@ def generate():
     return Response(stream_with_context(stream()), mimetype="text/event-stream")
 
 
-# New demo route: render the polished summary report template with sample data
+# render the polished summary report template
 @app.route('/report')
 def report_demo():
-    # Sample data to demonstrate the summary template
-    sample_data = {
-        'report_title': 'Wonderful Report Summary',
-        'report_subtitle': 'Model run summary and high-level recommendations',
-        'report_date': datetime.now().strftime('%B %d, %Y'),
-        'author': 'Automated Report System',
-        'executive_summary': 'This report summarizes the recent model run and highlights the primary findings, key metrics, and recommended next steps for stakeholders.',
-        'findings': [
-            {'title': 'Improved Accuracy', 'detail': 'Validation accuracy increased by 4.3% compared to previous run.'},
-            {'title': 'Lower Latency', 'detail': 'Average inference latency reduced by 18%.'}
-        ],
-        'recommendations': [
-            'Deploy new model to staging and monitor memory usage.',
-            'Increase batch size for throughput improvements where latency budget allows.',
-            'Collect more labeled samples for edge cases to improve robustness.'
-        ],
-        'notes': 'All experiments were run on a mixed GPU/CPU environment. See logs for per-run details.',
-        'metrics': {'Accuracy': '92.3%', 'Throughput': '480 req/s', 'Latency (p95)': '135 ms'},
-        'summary_table': [
-            {'label': 'Total Runs', 'value': '42'},
-            {'label': 'Successful', 'value': '40'},
-            {'label': 'Failed', 'value': '2'}
-        ],
-        'version': '1.0'
-    }
+    # If an auto-generated report JSON exists, read it and use that data
+    report_data = None
+    try:
+        if REPORT_PATH.exists():
+            with open(REPORT_PATH, 'r', encoding='utf-8') as fh:
+                obj = json.load(fh)
+                # Expecting {'summary': {...}, 'chart_config': {...}}
+                report_data = obj.get('summary', None)
+                chart_config = obj.get('chart_config', None)
+                if chart_config is not None:
+                    metrics_chart_json = json.dumps(chart_config)
+                else:
+                    metrics_chart_json = None
+        else:
+            report_data = None
+            metrics_chart_json = None
+    except Exception:
+        report_data = None
+        metrics_chart_json = None
 
-    # Example Chart.js configuration passed as JSON
-    chart_config = {
-        'type': 'bar',
-        'data': {
-            'labels': ['Accuracy', 'Throughput', 'Latency (p95)'],
-            'datasets': [{
-                'label': 'Metric Values',
-                'data': [92.3, 480, 135],
-                'backgroundColor': ['#4e79a7', '#f28e2b', '#e15759']
-            }]
-        },
-        'options': {
-            'responsive': True,
-            'plugins': {'legend': {'display': False}}
+    if report_data is None:
+        # Sample fallback data to demonstrate the template
+        sample_data = {
+            'report_title': 'Model Execution Report Summary',
+            'report_subtitle': 'Model run summary generated for demonstration purposes',
+            'report_date': datetime.now().strftime('%B %d, %Y'),
+            'author': 'Automated Report System',
+            'executive_summary': 'This report summarizes the recent model run and highlights the primary findings, key metrics, and recommended next steps for stakeholders.',
+            'findings': [
+                {'title': 'Improved Accuracy', 'detail': 'Validation accuracy increased by 4.3% compared to previous run.'},
+                {'title': 'Lower Latency', 'detail': 'Average inference latency reduced by 18%.'}
+            ],
+            'recommendations': [
+                'Deploy new model to staging and monitor memory usage.',
+                'Increase batch size for throughput improvements where latency budget allows.',
+                'Collect more labeled samples for edge cases to improve robustness.'
+            ],
+            'notes': 'All experiments were run on a mixed GPU/CPU environment. See logs for per-run details.',
+            'metrics': {'Accuracy': '92.3%', 'Throughput': '480 req/s', 'Latency (p95)': '135 ms'},
+            'summary_table': [
+                {'label': 'Total Runs', 'value': '42'},
+                {'label': 'Successful', 'value': '40'},
+                {'label': 'Failed', 'value': '2'}
+            ],
+            'version': '1.0'
         }
-    }
+        return render_template('model_report.html', **sample_data, metrics_chart_json=json.dumps(chart_config) if 'chart_config' in locals() else None)
+    else:
+        # Use the generated report data
+        return render_template('model_report.html', **report_data, metrics_chart_json=metrics_chart_json)
 
-    return render_template('summary.html', **sample_data, metrics_chart_json=json.dumps(chart_config))
 
+@app.route("/summary")
+def summary():
+    return render_template("summary.html")
 
 if __name__ == "__main__":
     app.run(debug=True)

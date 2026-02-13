@@ -1,8 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu130
 transformers
 accelerate
-torch==2.5.1+cu124
-torchvision==0.20.1+cu124
-torchaudio==2.5.1+cu124
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+torchaudio==2.10.0+cu130
 flask
 sentencepiece
