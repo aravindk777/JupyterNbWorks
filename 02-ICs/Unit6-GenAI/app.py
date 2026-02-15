@@ -24,8 +24,7 @@ Return only these sections exactly once, in order, no extra text:\n
 """
 
 MODELS_LIST = [
-    # Replaced the very large gpt-j-6B with smaller, easier-to-run alternatives for local testing
-    "EleutherAI/gpt-neo-125M",    # small causal LM, low resource
+    "EleutherAI/gpt-neo-125M",
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "google/flan-t5-base",
     "google/flan-t5-large",
@@ -52,7 +51,7 @@ def get_llm(model_name, force_reload: bool = False):
     if not model_name:
         raise ValueError("model_name is required")
 
-    # Quick path: return cached LLM if present (and not force_reload)
+    # cached data: return cached LLM if present (and not force_reload)
     with cache_lock:
         if not force_reload and model_name in model_cache:
             entry = model_cache.pop(model_name)
@@ -60,9 +59,8 @@ def get_llm(model_name, force_reload: bool = False):
             model_cache[model_name] = entry
             if entry.get('llm') is not None:
                 return entry['llm']
-            # If LLM not yet populated, we'll wait on per-model lock below
         else:
-            # create a placeholder entry with a per-model lock so concurrent loads coordinate
+            # create an empty cache entry with lock
             entry = {'llm': None, 'lock': threading.Lock()}
             model_cache[model_name] = entry
             # enforce cache size
@@ -70,7 +68,7 @@ def get_llm(model_name, force_reload: bool = False):
                 # pop the least recently used item
                 try:
                     model_cache.popitem(last=False)
-                except Exception:
+                except Exception as ex:
                     pass
 
     # Acquire the per-model lock while we perform the potentially expensive load
