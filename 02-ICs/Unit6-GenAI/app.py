@@ -42,6 +42,7 @@ cache_lock = threading.Lock()
 REPORT_DIR = Path(__file__).parent / 'reports'
 REPORT_PATH = REPORT_DIR / 'last_report.json'
 
+
 def get_llm(model_name, force_reload: bool = False):
     """Load and cache LangChain LLM in a thread-safe way.
 
@@ -94,7 +95,7 @@ def get_llm(model_name, force_reload: bool = False):
                 dtype = torch.float32 if device.type == "cpu" else torch.float16
             else:
                 dtype = torch.float16 if device.type == "cuda" else torch.float32
-            
+
             model = model_class.from_pretrained(model_name,
                                                 torch_dtype=dtype,
                                                 low_cpu_mem_usage=True
@@ -110,7 +111,7 @@ def get_llm(model_name, force_reload: bool = False):
             temperature=0.7,
             top_p=0.95,
         )
-        
+
         llm = HuggingFacePipeline(pipeline=pipe)
 
         # store into the cache entry
@@ -139,12 +140,14 @@ def index():
         error=None
     )
 
+
 @app.route("/generate")
 def generate():
     model_name = request.args.get("model_name")
     specs = request.args.get("specs")
     discount = request.args.get("discount")
     theme = request.args.get("theme")
+    ad_prompt = PROMPT_SYSTEM if request.args.get("ad_prompt") is None else request.args.get("ad_prompt")
 
     def stream():
         class StreamHandler(BaseCallbackHandler):
@@ -177,7 +180,7 @@ def generate():
 
             prompt_template = PromptTemplate.from_template(template)
             prompt = prompt_template.format(
-                system_prompt=PROMPT_SYSTEM,
+                system_prompt=ad_prompt,
                 specs=specs,
                 discount=discount,
                 theme=theme
@@ -187,26 +190,26 @@ def generate():
 
             generated_text = ""
             tokens_generated = 0
-            
+
             # Use llm.stream() for real LangChain streaming
             # Workaround for Seq2Seq models which have a bug in langchain-huggingface stream()
             if "t5" in model_name.lower():
                 # For Seq2Seq models, we use a manual streaming approach to avoid the 'inputs' TypeError
                 # which occurs in langchain-huggingface's internal threading logic.
                 from threading import Thread
-                
+
                 pipe = llm.pipeline
                 tokenizer = pipe.tokenizer
                 model = pipe.model
-                
+
                 # Use pipeline's config to stay consistent with original setup
                 gen_config = pipe.model.generation_config
-                
+
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                 # For Seq2Seq models, skip_prompt=True can sometimes cause issues or be unnecessary
                 # as the prompt is not in the decoder output.
                 streamer = TextIteratorStreamer(tokenizer, skip_prompt=False, skip_special_tokens=True)
-                
+
                 generation_kwargs = dict(
                     **inputs,
                     streamer=streamer,
@@ -215,10 +218,10 @@ def generate():
                     temperature=pipe.kwargs.get("temperature", 0.7),
                     top_p=pipe.kwargs.get("top_p", 0.95),
                 )
-                
+
                 thread = Thread(target=model.generate, kwargs=generation_kwargs)
                 thread.start()
-                
+
                 for chunk in streamer:
                     if not chunk:
                         continue
@@ -244,17 +247,20 @@ def generate():
                         'report_subtitle': 'Automatically generated after model run',
                         'report_date': datetime.now().strftime('%B %d, %Y'),
                         'author': 'AutoGenerator',
-                        'executive_summary': (generated_text[:1000] + '...') if len(generated_text) > 1000 else generated_text,
+                        'executive_summary': (generated_text[:1000] + '...') if len(
+                            generated_text) > 1000 else generated_text,
                         'findings': [],
                         'recommendations': [],
                         'notes': f'Generated {len(generated_text)} characters; tokens_estimate={tokens_generated}',
                         'metrics': {
                             'Chars': str(len(generated_text)),
-                            'Tokens_Est': str(tokens_generated)
+                            'Tokens_Est': str(tokens_generated),
+                            'words': str(len(generated_text.split()))
                         },
                         'summary_table': [
                             {'label': 'Generated Chars', 'value': str(len(generated_text))},
-                            {'label': 'Token Estimate', 'value': str(tokens_generated)}
+                            {'label': 'Token Estimate', 'value': str(tokens_generated)},
+                            {'label': 'Words', 'value': str(len(generated_text.split()))}
                         ],
                         'version': '1.0',
                         'generated_text': generated_text
@@ -262,7 +268,7 @@ def generate():
 
                     # Add recommendations based on the ratio of chars to tokens
                     try:
-                        tokens_val = float(512)/float(tokens_generated) if tokens_generated else 0.0
+                        tokens_val = float(512) / float(tokens_generated) if tokens_generated else 0.0
                         ratio = (len(generated_text) / tokens_val) if tokens_val > 0 else 0.0
                     except Exception:
                         ratio = 0.0
@@ -325,7 +331,7 @@ def generate():
 
 # render the polished summary report template
 @app.route('/report')
-def report_demo():
+def report_view():
     # If an auto-generated report JSON exists, read it and use that data
     report_data = None
     try:
@@ -355,7 +361,8 @@ def report_demo():
             'author': 'Automated Report System',
             'executive_summary': 'This report summarizes the recent model run and highlights the primary findings, key metrics, and recommended next steps for stakeholders.',
             'findings': [
-                {'title': 'Improved Accuracy', 'detail': 'Validation accuracy increased by 4.3% compared to previous run.'},
+                {'title': 'Improved Accuracy',
+                 'detail': 'Validation accuracy increased by 4.3% compared to previous run.'},
                 {'title': 'Lower Latency', 'detail': 'Average inference latency reduced by 18%.'}
             ],
             'recommendations': [
@@ -372,15 +379,17 @@ def report_demo():
             ],
             'version': '1.0'
         }
-        return render_template('model_report.html', **sample_data, metrics_chart_json=json.dumps(chart_config) if 'chart_config' in locals() else None)
+        return render_template('model_report.html', **sample_data,
+                               metrics_chart_json=json.dumps(chart_config) if 'chart_config' in locals() else None)
     else:
         # Use the generated report data
         return render_template('model_report.html', **report_data, metrics_chart_json=metrics_chart_json)
 
 
 @app.route("/summary")
-def summary():
+def summary_view():
     return render_template("summary.html")
+
 
 @app.route('/_cache')
 def cache_status():
@@ -391,7 +400,8 @@ def cache_status():
         entries = []
         for k, v in model_cache.items():
             entries.append({'model_name': k, 'loaded': bool(v.get('llm') is not None)})
-    return Response(json.dumps({'cache_max': CACHE_MAX, 'size': len(entries), 'entries': entries}, indent=2), mimetype='application/json')
+    return Response(json.dumps({'cache_max': CACHE_MAX, 'size': len(entries), 'entries': entries}, indent=2),
+                    mimetype='application/json')
 
 
 if __name__ == "__main__":
